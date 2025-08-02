@@ -12,27 +12,10 @@ google-cloud-storage==2.19.0
 google-cloud-firestore==2.21.0
 google-cloud-secret-manager==2.22.0
 google-cloud-documentai==2.29.1
+PyMuPDF==1.24.9
+gunicorn==22.0.0
 google-cloud-aiplatform==1.98.0
 google-genai==1.17.0
-google-adk>=1.2.1
-
-# Azure Services
-azure-ai-documentintelligence==1.0.0b4
-azure-core==1.32.0
-
-# PDF Processing (updated for compatibility)
-PyMuPDF==1.26.3
-
-# Web Server
-gunicorn==22.0.0
-
-# Browser Automation
 selenium==4.22.0
-
-# Image Processing
 Pillow==10.4.0
-opencv-python-headless==4.12.0.88
-numpy==2.2.6
-
-# Version Control and Testing Dependencies
-gitpython==3.1.40
+google-adk==1.4.1
