@@ -1,3 +1,38 @@
+# Update 11: Automatic Underscore-Based Form Field Detection
+
+## Objective
+Develop a robust backend solution for detecting form fields based on underscore lines in PDFs, mirroring macOS's behavior.
+
+## Challenges Identified
+- Azure Document Intelligence tends to clean or normalize text, removing underscores.
+- Local detection methods can succeed but require performance optimization.
+
+## Proposed Solution Steps
+
+### Step 1: Update PDF Analysis Tools
+- **File:** `backend/requirements.txt`
+  - **Action:** Ensure `opencv-python-headless` and `numpy` are included for high-performance image processing.
+
+### Step 2: Implement High-Speed Vector Analysis
+- **File:** `backend/agents/document_automation_manager/tools.py`
+  - **Change:** Refactor this file to:
+    - Use `PyMuPDF` to extract vector graphics as a clean image.
+    - Apply `opencv-python-headless` to detect horizontal lines quickly.
+    - Correlate detected lines with text to identify labels and form fields.
+
+### Step 3: Update Local Heuristics Method
+- Rewrite the `extract_fields_with_local_heuristics` function to:
+  - Consolidate both vector graphic analysis and text detection.
+  - Merge these results to produce a comprehensive list of form fields.
+
+### Step 4: Simplify Agent Workflow
+- **Files:** `backend/agents/document_automation_manager/agent.py`, `prompt.py`
+  - **Action:** Update agent logic to solely rely on improved local detection for underscore-based form fields, removing fallback to less reliable cloud methods.
+
+## Expected Outcome
+- Achieve high accuracy and performance in detecting underscore-based form fields.
+- Enhance user experience by ensuring fields are found reliably and efficiently.
+
 # Update 10: The Azure Migration
 
 ## 1. Objective
