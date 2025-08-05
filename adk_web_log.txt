@@ -1,0 +1,21 @@
+Traceback (most recent call last):
+  File "/opt/miniconda3/envs/bidagents/lib/python3.12/site-packages/opentelemetry/trace/__init__.py", line 589, in use_span
+    yield span
+  File "/opt/miniconda3/envs/bidagents/lib/python3.12/site-packages/opentelemetry/sdk/trace/__init__.py", line 1105, in start_as_current_span
+    yield span
+  File "/opt/miniconda3/envs/bidagents/lib/python3.12/site-packages/opentelemetry/trace/__init__.py", line 454, in start_as_current_span
+    yield span
+  File "/opt/miniconda3/envs/bidagents/lib/python3.12/site-packages/google/adk/flows/llm_flows/base_llm_flow.py", line 556, in _call_llm_async
+    yield llm_response
+GeneratorExit
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/opt/miniconda3/envs/bidagents/lib/python3.12/site-packages/opentelemetry/context/__init__.py", line 155, in detach
+    _RUNTIME_CONTEXT.detach(token)
+  File "/opt/miniconda3/envs/bidagents/lib/python3.12/site-packages/opentelemetry/context/contextvars_context.py", line 53, in detach
+    self._current_context.reset(token)
+ValueError: <Token var=<ContextVar name='current_context' default={} at 0x109256fc0> at 0x13e4379c0> was created in a different Context
+INFO:     127.0.0.1:57570 - "GET /apps/agents/users/user/sessions/c02b983a-9109-438f-a04e-49d23ee2e5e2 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57571 - "GET /debug/trace/session/c02b983a-9109-438f-a04e-49d23ee2e5e2 HTTP/1.1" 200 OK

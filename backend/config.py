@@ -52,6 +52,10 @@ def load_config():
         # SendGrid
         'SENDGRID_API_KEY': os.environ.get('SENDGRID_API_KEY'),
         
+        # Sentry
+        'SENTRY_DSN': os.environ.get('SENTRY_DSN'),
+        'SENTRY_ENVIRONMENT': os.environ.get('SENTRY_ENVIRONMENT', 'development'),
+        
         # Pub/Sub Topics
         'PUBSUB_TOPIC_DISCOVERY': os.environ.get('PUBSUB_TOPIC_DISCOVERY', 'bid-discovery'),
         'PUBSUB_TOPIC_DOWNLOAD': os.environ.get('PUBSUB_TOPIC_DOWNLOAD', 'bid-download'),

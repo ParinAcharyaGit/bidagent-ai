@@ -2,6 +2,7 @@ import os
 import json
 import re
 import traceback
+import time
 import fitz  # PyMuPDF
 import numpy as np
 import cv2
@@ -16,6 +17,20 @@ if project_root not in sys.path:
 
 from backend.config import load_config
 from backend.agents.shared_libraries.utils import get_absolute_path, get_output_path
+
+# Import Sentry for error tracking
+try:
+    from backend.sentry_config import capture_exception, capture_message, add_breadcrumb
+    SENTRY_AVAILABLE = True
+except ImportError:
+    SENTRY_AVAILABLE = False
+    # Fallback functions when Sentry is not available
+    def capture_exception(error, extra_context=None):
+        pass
+    def capture_message(message, level='info', extra_context=None):
+        pass
+    def add_breadcrumb(message, category='custom', level='info', data=None):
+        pass
 
 # ============================================
 # Tier 1 Analysis Tool: Azure OCR
@@ -411,207 +426,208 @@ def extract_fields_with_local_heuristics(file_path: str) -> str:
     
     This mirrors the approach used by professional tools like macOS PDF viewers.
     """
-    import time
-    start_time = time.time()
+    # Import time at module level to avoid context issues
+    # start_time = time.time()
     
     try:
-        print(f"Starting local analysis...")
-        
         doc = fitz.open(get_absolute_path(file_path))
         all_form_fields = []
         
-        # Limit processing to first 3 pages to prevent hanging
-        max_pages = min(len(doc), 3)
-        print(f"Processing {max_pages} pages...")
+        max_pages = min(len(doc), 100)
 
         for page_num, page in enumerate(doc[:max_pages]):
-            print(f"Page {page_num + 1}/{max_pages}...")
-            
             if len(page.get_text()) < 50:
                 continue
 
-            # Step 1: Vector Graphics Analysis
             vector_lines = extract_vector_lines_fast(page, page_num)
-            
-            # Step 2: Text-Based Underscore Detection
             text_underscore_rects = extract_text_underscores(page)
             
-            # Step 3: Combine detected areas
             all_field_rects = vector_lines + text_underscore_rects
-            merged_rects = merge_overlapping_rects(all_field_rects, tolerance=3)
+            # Increase tolerance to merge fields that are close but not strictly overlapping.
+            merged_rects = merge_overlapping_rects(all_field_rects, tolerance=10)
             
-            # Step 4: Find labels and create form fields
+            # Define a standard height for all form fields
+            STANDARD_FIELD_HEIGHT = 12  # in points
+
             for i, rect in enumerate(merged_rects):
+                # Standardize the height of the rectangle around its vertical center
+                original_center_y = (rect.y0 + rect.y1) / 2
+                rect.y0 = original_center_y - (STANDARD_FIELD_HEIGHT / 2)
+                rect.y1 = original_center_y + (STANDARD_FIELD_HEIGHT / 2)
+
                 field_name = find_field_label(page, rect, page_num, i)
                 
-                # Skip common non-fields
                 if len(field_name) < 2 or "signature" in field_name.lower():
                     continue
 
+                # IMPORTANT: This is the full, correct data structure for a field
                 all_form_fields.append({
                     "field_name": field_name,
                     "field_type": "text",
                     "is_required": False,
                     "page_number": page_num + 1,
-                    "coordinates": [
+                    "coordinates": [ # The coordinates must be included here
                         {"x": rect.x0/page.rect.width, "y": rect.y0/page.rect.height},
                         {"x": rect.x1/page.rect.width, "y": rect.y0/page.rect.height},
                         {"x": rect.x1/page.rect.width, "y": rect.y1/page.rect.height},
                         {"x": rect.x0/page.rect.width, "y": rect.y1/page.rect.height}
-                    ],
-                    "detection_method": "high_speed_vector_analysis"
+                    ]
                 })
+        
+        doc.close()
         
         if not all_form_fields:
             return '{"error": "No form fields were found using high-speed vector analysis."}'
         
-        total_time = time.time() - start_time
-        print(f"Analysis complete. Found {len(all_form_fields)} fields in {total_time:.1f}s")
+        # --- THIS IS THE CORRECTED SECTION ---
         
-        return json.dumps({
-            "form_fields": all_form_fields, 
+        # 1. Define the full blueprint structure with ALL fields and coordinates
+        full_blueprint_data = {
+            "form_fields": all_form_fields, # Use the list that contains the coordinates
             "detection_method": "high_speed_vector_analysis",
-            "total_fields": len(all_form_fields),
-            "processing_time_seconds": round(total_time, 2)
-        }, indent=2)
+            "total_fields": len(all_form_fields)
+        }
+        
+        # 2. Save the complete blueprint data to the file
+        temp_path = get_output_path("temp_local_blueprint", ".json")
+        try:
+            with open(temp_path, 'w') as f:
+                json.dump(full_blueprint_data, f, indent=2)
+            blueprint_path_for_adk = temp_path
+        except Exception as e:
+            print(f"Warning: Could not save blueprint file: {e}")
+            blueprint_path_for_adk = None
+        
+        # 3. Create the simplified response for the ADK agent separately
+        simplified_fields_for_adk = []
+        for field in all_form_fields[:3]: # Limit to first 3 for display to prevent token limit issues
+            simplified_fields_for_adk.append({
+                "field_name": field["field_name"][:30],  # Also reduce field name length
+                "page_number": field["page_number"]
+            })
+        
+        # 4. Return the simplified list to the agent, but the file is saved with full data
+        return json.dumps({
+            "form_fields": simplified_fields_for_adk,
+            "total_found": len(all_form_fields),
+            "blueprint_saved_to": blueprint_path_for_adk
+        })
 
     except Exception as e:
         return f'{{"error": "An error occurred in high-speed vector analysis: {type(e).__name__} - {str(e)}"}}'
 
-def extract_vector_lines_fast(page, page_num):
-    """
-    High-speed vector graphics extraction using PyMuPDF's drawing analysis.
-    This mimics professional PDF tools by analyzing the actual vector graphics structure.
-    """
-    import time
-    
-    try:
-        # Method 1: Direct drawing analysis (fastest)
-        drawings = page.get_drawings()
-        line_rects = []
-        
-        for drawing in drawings:
-            # Handle different drawing object structures
-            if isinstance(drawing, dict):
-                items = drawing.get("items", [])
-            else:
-                # For tuple/other formats, try to access as a sequence
-                try:
-                    items = drawing[1] if len(drawing) > 1 else []
-                except (TypeError, IndexError):
-                    items = []
-            
-            for path in items:
-                if isinstance(path, dict) and path.get("type") == "l":  # Line type
-                    points = path.get("points", [])
-                    if len(points) >= 2:
-                        # Check if it's a horizontal line suitable for form field
-                        start_point = points[0]
-                        end_point = points[-1]
-                        
-                        x0, y0 = start_point
-                        x1, y1 = end_point
-                        
-                        # Only consider horizontal lines with reasonable length
-                        line_width = abs(x1 - x0)
-                        line_height = abs(y1 - y0)
-                        
-                        if line_width > 30 and line_height < 5 and line_width > line_height * 3:
-                            # Create a bounding rectangle for the line
-                            rect = fitz.Rect(min(x0, x1), min(y0, y1) - 2, max(x0, x1), max(y0, y1) + 2)
-                            line_rects.append(rect)
-        
-        # Method 2: Rasterization + OpenCV analysis (fallback for complex graphics)
-        if len(line_rects) < 3:  # If we didn't find many lines, try OpenCV method            
-            # Render page to image for computer vision analysis
-            dpi = 120  # Further reduced DPI for better performance
-            pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csGRAY, alpha=False)
-            img_data = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w)
-            
-            # Invert image for line detection (lines become white on black background)
-            inverted_img = cv2.bitwise_not(img_data)
-            
-            # Apply morphological operations to enhance line detection
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (20, 1))
-            morph = cv2.morphologyEx(inverted_img, cv2.MORPH_OPEN, kernel)
-            
-            # Detect lines using HoughLinesP
-            lines = cv2.HoughLinesP(morph, rho=1, theta=np.pi/180, threshold=30, minLineLength=30, maxLineGap=3)  # More lenient parameters
-            
-            if lines is not None:
-                for line in lines:
-                    x1, y1, x2, y2 = line[0]
-                    
-                    # Convert back from image coordinates to PDF coordinates
-                    pdf_x1 = (x1 / pix.w) * page.rect.width
-                    pdf_y1 = (y1 / pix.h) * page.rect.height
-                    pdf_x2 = (x2 / pix.w) * page.rect.width
-                    pdf_y2 = (y2 / pix.h) * page.rect.height
-                    
-                    # Filter for horizontal lines
-                    line_width = abs(pdf_x2 - pdf_x1)
-                    line_height = abs(pdf_y2 - pdf_y1)
-                    
-                    if line_width > 30 and line_height < 10 and line_width > line_height * 2:
-                        rect = fitz.Rect(min(pdf_x1, pdf_x2), min(pdf_y1, pdf_y2) - 3, 
-                                       max(pdf_x1, pdf_x2), max(pdf_y1, pdf_y2) + 3)
-                        line_rects.append(rect)
-        
-        return line_rects
-    
-    except Exception as e:
-        return []
 
-def extract_text_underscores(page):
+
+def extract_vector_lines_fast(page: fitz.Page, page_num: int) -> list:
     """
-    Extract individual underscore segments directly from text using PyMuPDF's text analysis.
-    This finds actual underscore characters and creates separate fields for each segment.
+    (REVISED) Extracts lines using a more robust two-pronged approach:
+    1. Direct vector graphics analysis via page.get_drawings().
+    2. A more sensitive OpenCV analysis on a higher-resolution rasterization of the page.
+    This function now runs both methods to catch different types of lines.
     """
+    line_rects = []
+
+    # --- Method 1: Direct drawing analysis (Fast, for clean vector lines) ---
     try:
-        underscore_rects = []
+        drawings = page.get_drawings()
+        for drawing in drawings:
+            # This part of your original code is good, but we can relax the constraints slightly.
+            for path in drawing.get("items", []):
+                if path[0] == "l":  # Check for a line command
+                    p1, p2 = path[1], path[2]
+                    # Check for horizontal-ish lines
+                    if abs(p1.y - p2.y) < 5 and abs(p1.x - p2.x) > 20: # Length > 20, height diff < 5
+                        rect = fitz.Rect(p1, p2)
+                        # Add a small vertical tolerance to the bounding box
+                        rect.y0 -= 2
+                        rect.y1 += 2
+                        line_rects.append(rect)
+    except Exception as e:
+        # print(f"Warning: Could not process vector drawings on page {page_num}: {e}")
+        pass # Continue to CV analysis
+        # print(f"ERROR in {__name__}: {e}") # This will print any hidden errors
+
+    # --- Method 2: Rasterization + OpenCV analysis (More robust for drawn/scanned lines) ---
+    try:
+        # Render page to a higher-quality image for better analysis
+        dpi = 150  # Increased DPI for better line fidelity. Trade-off: uses more memory.
+        pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csGRAY, alpha=False)
         
-        # Method 1: Character-level analysis to find individual underscore segments
-        text_blocks = page.get_text("dict")
-        for block in text_blocks.get("blocks", []):
-            if "lines" in block:
-                for line in block["lines"]:
-                    for span in line.get("spans", []):
-                        text = span.get("text", "")
-                        bbox = span.get("bbox")
-                        
-                        if bbox and "_" in text:
-                            # Find all underscore segments in this span
-                            underscore_segments = find_underscore_segments_in_text(text, bbox)
-                            underscore_rects.extend(underscore_segments)
+        # Safety check for very large images
+        if pix.width * pix.height > 10_000_000: # Limit to 10 megapixels
+            return line_rects
+
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w)
         
-        # Method 2: Word-level analysis for backup detection
-        words = page.get_text("words")
+        inverted_img = cv2.bitwise_not(img)
         
-        for word in words:
-            x0, y0, x1, y1, text = word[:5]
-            
-            # Look for words that are primarily underscores
-            if "_" in text:
-                underscore_count = text.count("_")
-                total_chars = len(text)
+        # Use a less aggressive kernel to avoid deleting shorter lines.
+        # This kernel will find horizontal lines of about 15px or longer.
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 1))
+        morph = cv2.morphologyEx(inverted_img, cv2.MORPH_OPEN, kernel)
+        
+        # Loosen HoughLinesP parameters to catch more potential lines.
+        # minLineLength is now shorter, maxLineGap is larger to connect dashed lines.
+        lines = cv2.HoughLinesP(
+            morph, 
+            rho=1, 
+            theta=np.pi / 180, 
+            threshold=50, 
+            minLineLength=30,  # Reduced from 50
+            maxLineGap=15      # Increased from 5
+        )
+        
+        if lines is not None:
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
                 
-                # Consider it an underscore field if >70% of characters are underscores
-                # or if it's a long sequence of underscores
-                if (underscore_count / total_chars > 0.7) or (underscore_count >= 5):
-                    rect = fitz.Rect(x0, y0, x1, y1)
-                    
-                    # Check if this overlaps with existing segments (avoid duplicates)
-                    is_duplicate = any(rect.intersects(existing) for existing in underscore_rects)
-                    if not is_duplicate:
-                        underscore_rects.append(rect)
+                # Convert image coordinates back to PDF coordinates
+                pdf_rect = fitz.Rect(x1, y1, x2, y2) / dpi * 72
+                
+                # Filter for horizontal lines again after detection
+                if pdf_rect.height < 10 and pdf_rect.width > 20:
+                    # Add vertical padding to ensure it can be merged and found
+                    pdf_rect.y0 -= 3
+                    pdf_rect.y1 += 3
+                    line_rects.append(pdf_rect)
+
+    except Exception as e:
+        # print(f"Warning: OpenCV analysis failed on page {page_num}: {e}")
+        # print(f"ERROR in {__name__}: {e}") # This will print any hidden errors
+        pass
         
-        # Sort by position (top to bottom, left to right)
-        underscore_rects.sort(key=lambda r: (r.y0, r.x0))
-        
-        return underscore_rects
+    return line_rects
+
+def extract_text_underscores(page: fitz.Page) -> list:
+    """
+    (REVISED) Extracts underscore characters with improved accuracy.
+    Uses `get_text("rawdict")` to get precise bounding boxes for each character,
+    eliminating the guesswork of proportional fonts.
+    """
+    underscore_rects = []
+    
+    try:
+        # "rawdict" provides character-level detail including precise bboxes
+        blocks = page.get_text("rawdict").get("blocks", [])
+        for block in blocks:
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    for char in span.get("chars", []):
+                        # Check if the character is an underscore
+                        if char.get("c") == "_":
+                            # Use the precise bounding box for this character
+                            bbox = char.get("bbox")
+                            if bbox:
+                                underscore_rects.append(fitz.Rect(bbox))
     
     except Exception as e:
-        return []
+        # print(f"Warning: Could not extract text underscores: {e}")
+        print(f"ERROR in {__name__}: {e}") # This will print any hidden errors
+        # pass
+        
+    # After finding all individual underscore characters, we merge adjacent ones.
+    # The main `merge_overlapping_rects` will handle this perfectly.
+    return underscore_rects
 
 def find_underscore_segments_in_text(text, bbox):
     """
@@ -648,134 +664,74 @@ def find_underscore_segments_in_text(text, bbox):
             segments.append(segment_rect)
     
     except Exception as e:
-        print(f"[DEBUG-VECTOR] Error analyzing underscore segments: {e}")
+        print(f"ERROR in {__name__}: {e}") # This will print any hidden errors
+        # pass  # Silently handle errors to prevent output overflow
     
     return segments
 
 def find_field_label(page, rect, page_num, index):
     """
-    Intelligent field label detection using spatial analysis.
-    Looks for text labels positioned logically relative to form fields.
-    Optimized for individual underscore segments.
+    (REVISED) Intelligent field label detection that prioritizes finding any valid
+    label but reliably falls back to a generic name if no suitable label is found.
     """
     try:
-        # Calculate field center for distance-based scoring
-        field_center_x = (rect.x0 + rect.x1) / 2
-        field_center_y = (rect.y0 + rect.y1) / 2
-        
         # Search areas: prioritize closer areas to this specific field
         search_areas = [
-            # Primary: Immediately to the left of the field (narrow search)
-            fitz.Rect(max(0, rect.x0 - 150), rect.y0 - 5, rect.x0 - 2, rect.y1 + 5),
-            # Secondary: Slightly above the field 
-            fitz.Rect(rect.x0 - 30, max(0, rect.y0 - 20), rect.x1 + 30, rect.y0 - 1),
-            # Tertiary: Broader left search for longer labels
-            fitz.Rect(max(0, rect.x0 - 300), rect.y0 - 15, rect.x0 - 5, rect.y1 + 15)
+            # Primary: Immediately to the left of the field
+            fitz.Rect(max(0, rect.x0 - 200), rect.y0 - 10, rect.x0 - 3, rect.y1 + 10),
+            # Secondary: Directly above the field 
+            fitz.Rect(rect.x0 - 10, max(0, rect.y0 - 30), rect.x1 + 10, rect.y0 - 2),
         ]
         
-        best_label = ""
-        best_score = 0
+        candidate_words = []
         
-        for area_idx, search_area in enumerate(search_areas):
-            # Get words in the search area
-            words = page.get_text("words", clip=search_area)
+        # Get all words on the page once to avoid repeated calls
+        all_words = page.get_text("words")
+        
+        # Common non-label words to filter out
+        stop_words = {'the', 'and', 'or', 'of', 'to', 'in', 'for', 'on', 'at', 'a', 'an', 'no', 'is', 'are', 'was', 'were'}
+
+        for area in search_areas:
+            # Filter words that are inside our search area
+            words_in_area = [w for w in all_words if fitz.Rect(w[:4]).intersects(area)]
             
-            if words:
-                # Filter and score words based on proximity and relevance
-                candidate_words = []
+            for word in words_in_area:
+                x0, y0, x1, y1, text = word[:5]
+                text_clean = text.strip()
                 
-                for word in words:
-                    x0, y0, x1, y1, text = word[:5]
-                    word_center_x = (x0 + x1) / 2
-                    word_center_y = (y0 + y1) / 2
-                    
-                    # Skip very short words, numbers only, underscore-heavy words, or common non-label words
-                    text_clean = text.strip()
-                    underscore_ratio = text_clean.count('_') / len(text_clean) if len(text_clean) > 0 else 0
-                    
-                    if (len(text_clean) >= 2 and 
-                        not text_clean.isdigit() and 
-                        underscore_ratio < 0.5 and  # Skip words that are mostly underscores
-                        text_clean.lower() not in ['the', 'and', 'or', 'of', 'to', 'in', 'for', 'on', 'at', 'a', 'an', 'no', 'no.']):
-                        
-                        # Calculate distance from word to field
-                        distance = ((word_center_x - field_center_x) ** 2 + (word_center_y - field_center_y) ** 2) ** 0.5
-                        candidate_words.append((text_clean, distance, word_center_y, word_center_x))
-                
-                if candidate_words:
-                    # Sort by distance (closer words first), then by position
-                    candidate_words.sort(key=lambda w: (w[1], w[2], w[3]))
-                    
-                    # Build label from closest relevant words (limit to prevent overly long labels)
-                    label_words = [w[0] for w in candidate_words[:3]]  # Max 3 words for precision
-                    
-                    # Remove duplicate words while preserving order
-                    seen = set()
-                    unique_words = []
-                    for word in label_words:
-                        word_lower = word.lower()
-                        if word_lower not in seen:
-                            unique_words.append(word)
-                            seen.add(word_lower)
-                    
-                    candidate_label = " ".join(unique_words).strip(": \n\t")
-                    candidate_label = re.sub(r'\s+', ' ', candidate_label)
-                    
-                    # Score the label based on quality indicators
-                    score = 0
-                    
-                    # Prefer labels that end with colon
-                    if candidate_label.endswith(':'):
-                        score += 15
-                        candidate_label = candidate_label[:-1].strip()
-                    
-                    # Prefer labels with field-like keywords
-                    field_keywords = ['name', 'address', 'phone', 'email', 'date', 'number', 
-                                    'company', 'title', 'license', 'amount', 'total', 'description',
-                                    'bid', 'contractor', 'contact', 'signature', 'type', 'code', 'id']
-                    
-                    keyword_matches = sum(1 for keyword in field_keywords if keyword in candidate_label.lower())
-                    score += keyword_matches * 8
-                    
-                    # Prefer labels from closer search areas (more precise)
-                    if area_idx == 0:  # Immediate left
-                        score += 10
-                    elif area_idx == 1:  # Above
-                        score += 5
-                    
-                    # Prefer shorter, more concise labels
-                    if len(candidate_label) <= 15:
-                        score += 5
-                    elif len(candidate_label) <= 25:
-                        score += 2
-                    
-                    # Penalize very long labels or generic text
-                    if (len(candidate_label) > 40 or 
-                        any(word in candidate_label.lower() for word in ['page', 'form', 'document', 'section', 'instructions'])):
-                        score -= 10
-                    
-                    # Bonus for proximity (closer words get higher scores)
-                    if candidate_words and candidate_words[0][1] < 50:  # Very close
-                        score += 5
-                    elif candidate_words and candidate_words[0][1] < 100:  # Reasonably close
-                        score += 2
-                    
-                    if score > best_score:
-                        best_score = score
-                        best_label = candidate_label
+                # Basic filtering for relevance
+                if len(text_clean) > 1 and not text_clean.isdigit() and text_clean.lower() not in stop_words:
+                    candidate_words.append(word)
+
+        if not candidate_words:
+            # If no words are found nearby, immediately return a generic label
+            return f"Field_{page_num + 1}_{index + 1}"
+
+        # Sort candidates primarily by vertical alignment, then by horizontal position (right-to-left)
+        field_v_center = (rect.y0 + rect.y1) / 2
+        candidate_words.sort(key=lambda w: (abs((w[1] + w[3]) / 2 - field_v_center), -w[2])) # sort by vertical proximity, then reverse horizontal
+
+        # Build the label from the best candidates (up to 4 words)
+        label_words = [w[4] for w in candidate_words[:4]]
         
-        # Clean up the best label
-        if best_label and best_score > 0:
-            best_label = re.sub(r'[^a-zA-Z0-9\s\-_().,]', '', best_label).strip()
-            best_label = best_label[:40]  # Reasonable length limit
-            
-            if len(best_label) >= 2:
-                return best_label
+        # The words are sorted right-to-left, so we reverse them to get natural reading order
+        label_words.reverse()
         
-        # Fallback to generic name
-        return f"Field_{page_num + 1}_{index + 1}"
-    
+        best_label = " ".join(label_words)
+        
+        # Clean up the final label
+        best_label = re.sub(r'[^a-zA-Z0-9\s]', '', best_label).strip() # Remove punctuation
+        best_label = re.sub(r'\s+', ' ', best_label) # Consolidate whitespace
+
+        # If after all that, the label is empty or too short, fall back to generic.
+        if len(best_label) < 2:
+            return f"Field_{page_num + 1}_{index + 1}"
+        
+        return best_label[:50]  # Return the found label, truncated to 50 chars
+
     except Exception as e:
+        # If any error occurs, always return a generic name
+        # print(f"Error in find_field_label: {e}") # You can uncomment for debugging
         return f"Field_{page_num + 1}_{index + 1}"
 
 # ============================================
@@ -793,44 +749,85 @@ def list_pdf_form_fields(pdf_path: str) -> str:
     except Exception as e:
         return f'{{"error": "An error occurred while processing the PDF: {str(e)}"}}'
 
+
 def create_fields_from_blueprint(pdf_path: str, json_blueprint_path: str) -> str:
-    """Adds empty form fields to a PDF based on a JSON blueprint file."""
+    """(DEBUG VERSION) Adds empty form fields to a PDF based on a JSON blueprint file."""
+    print("\n--- [DEBUG] Starting create_fields_from_blueprint ---")
     try:
         absolute_pdf_path = get_absolute_path(pdf_path)
+        print(f"[DEBUG] Absolute PDF Path: {absolute_pdf_path}")
+
+        # --- Step 1: Locate the Blueprint ---
+        if json_blueprint_path is None:
+            json_blueprint_path = get_output_path("temp_local_blueprint", ".json")
+            print(f"[DEBUG] Blueprint path not provided, using temporary path: {json_blueprint_path}")
+        
+        if not os.path.exists(json_blueprint_path):
+            error_msg = "FATAL: Blueprint file not found at the specified path."
+            print(f"[DEBUG] {error_msg}")
+            return json.dumps({"error": error_msg, "path_checked": json_blueprint_path})
+        
+        print(f"[DEBUG] Found blueprint file. Loading from: {json_blueprint_path}")
         with open(get_absolute_path(json_blueprint_path), 'r') as f:
             blueprint = json.load(f)
 
+        # --- Step 2: Load PDF and Process Fields ---
         doc = fitz.open(absolute_pdf_path)
+        print(f"[DEBUG] Successfully opened PDF with {len(doc)} pages.")
         
-        # Keep track of sanitized names to ensure uniqueness
+        form_fields_to_process = blueprint.get("form_fields", [])
+        total_fields = len(form_fields_to_process)
+        if total_fields == 0:
+            print("[DEBUG] WARNING: The blueprint contains 0 form fields. Nothing to create.")
+        else:
+            print(f"[DEBUG] Found {total_fields} fields in blueprint to process.")
+
         used_field_names = set()
+        fields_added_count = 0
 
-        def sanitize_field_name(name: str) -> str:
-            # Remove invalid characters, replace spaces with underscores
-            name = re.sub(r'[^a-zA-Z0-9_]', '', name.replace(' ', '_'))
-            # Truncate to a reasonable length
-            return name[:50]
+        # --- Step 3: Loop Through Each Field in Blueprint ---
+        for i, field in enumerate(form_fields_to_process):
+            original_name = field.get("field_name", f"unnamed_field_{i}")
+            print(f"\n[DEBUG] Processing Field {i+1}/{total_fields}: '{original_name}'")
 
-        for field in blueprint.get("form_fields", []):
-            page_num_one_based = field.get("page_number", 1)
-            if not (1 <= page_num_one_based <= len(doc)):
-                print(f"[DEBUG-PDF] Skipping field '{field.get('field_name')}' due to invalid page number: {page_num_one_based}.")
+            # VALIDATION 1: Page Number
+            page_num_one_based = field.get("page_number")
+            if not isinstance(page_num_one_based, int) or not (1 <= page_num_one_based <= len(doc)):
+                print(f"  -> [SKIP] Invalid or missing page number: {page_num_one_based}")
                 continue
             
             page = doc[page_num_one_based - 1]
-            coords = field.get("coordinates", [])
 
-            if not (isinstance(coords, list) and len(coords) == 4 and
-                    all(isinstance(p, dict) and 'x' in p and 'y' in p and
-                        isinstance(p['x'], (int, float)) and isinstance(p['y'], (int, float))
-                        for p in coords)):
-                print(f"[DEBUG-PDF] Skipping field '{field.get('field_name')}' due to invalid or malformed coordinates.")
+            # VALIDATION 2: Coordinates
+            coords = field.get("coordinates")
+            if not (isinstance(coords, list) and len(coords) == 4):
+                print(f"  -> [SKIP] Coordinates are not a list of 4 points. Value: {coords}")
                 continue
 
-            original_name = field.get("field_name", "unnamed")
-            sanitized_name = sanitize_field_name(original_name)
+            try:
+                # These calculations will fail if coords are not in the expected [{x,y},...] format
+                x0 = coords[0]['x'] * page.rect.width
+                y0 = coords[0]['y'] * page.rect.height
+                x1 = coords[2]['x'] * page.rect.width
+                y1 = coords[2]['y'] * page.rect.height
+            except (TypeError, KeyError, IndexError) as e:
+                print(f"  -> [SKIP] Malformed coordinate structure. Error: {e}. Coords: {coords}")
+                continue
+
+            # Add a vertical offset to prevent obscuring the baseline (e.g., semi-colons)
+            VERTICAL_OFFSET_PERCENTAGE = 0.005  # 0.5% of page height
+            vertical_offset = page.rect.height * VERTICAL_OFFSET_PERCENTAGE
+            y0 -= vertical_offset
+            y1 -= vertical_offset
             
-            # Ensure the field name is unique
+            # VALIDATION 3: Rectangle Dimensions
+            if x1 <= x0 or y1 <= y0:
+                print(f"  -> [SKIP] Invalid rectangle dimensions (x1 <= x0 or y1 <= y0). Coords: ({x0}, {y0}, {x1}, {y1})")
+                continue
+
+            # If all validations pass, create the widget
+            # (Your sanitization logic is good, keeping it as is)
+            sanitized_name = re.sub(r'[^a-zA-Z0-9_]', '', original_name.replace(' ', '_'))[:50]
             unique_name = sanitized_name
             counter = 1
             while unique_name in used_field_names:
@@ -838,19 +835,7 @@ def create_fields_from_blueprint(pdf_path: str, json_blueprint_path: str) -> str
                 counter += 1
             used_field_names.add(unique_name)
 
-            x0 = coords[0]['x'] * page.rect.width
-            y0 = coords[0]['y'] * page.rect.height
-            x1 = coords[2]['x'] * page.rect.width
-            y1 = coords[2]['y'] * page.rect.height
-
-            # Also validate the rectangle dimensions themselves to prevent errors
-            if x1 <= x0 or y1 <= y0:
-                print(f"[DEBUG-PDF] Skipping field '{unique_name}' due to invalid rectangle dimensions (x1 <= x0 or y1 <= y0). Coords: ({x0}, {y0}, {x1}, {y1})")
-                continue
-
             rect = fitz.Rect(x0, y0, x1, y1)
-            
-            # Create widget by setting attributes for compatibility with older PyMuPDF.
             widget = fitz.Widget()
             widget.rect = rect
             widget.field_type = fitz.PDF_WIDGET_TYPE_TEXT
@@ -858,15 +843,120 @@ def create_fields_from_blueprint(pdf_path: str, json_blueprint_path: str) -> str
             widget.field_value = ""
             
             page.add_widget(widget)
-        
-        output_path = get_output_path(pdf_path, "_fields_created")
-        doc.save(output_path, garbage=4, deflate=True, clean=True)
-        return f'{{"success": true, "path": "{output_path}"}}'
+            fields_added_count += 1
+            print(f"  -> [SUCCESS] Added widget '{unique_name}' to page {page_num_one_based}.")
+
+        # --- Step 4: Save the Final Document ---
+        print(f"\n[DEBUG] Finished processing. Total fields added: {fields_added_count}/{total_fields}")
+        if fields_added_count > 0:
+            output_path = get_output_path(pdf_path, "_fields_created")
+            print(f"[DEBUG] Saving final PDF to: {output_path}")
+            doc.save(output_path, garbage=4, deflate=True, clean=True)
+            doc.close()
+            return json.dumps({"success": True, "path": output_path, "fields_added": fields_added_count})
+        else:
+            doc.close()
+            print("[DEBUG] No fields were added, so no output file was saved.")
+            return json.dumps({"error": "No new fields were added to the PDF.", "fields_added": 0})
+
     except Exception as e:
         tb_str = traceback.format_exc()
         error_message = f"An error occurred during field creation: {type(e).__name__} - {str(e)}\nTraceback:\n{tb_str}"
-        print(f"[DEBUG-PDF] {error_message}")
+        print(f"[DEBUG] {error_message}")
         return json.dumps({"error": error_message})
+
+# def create_fields_from_blueprint(pdf_path: str, json_blueprint_path: str) -> str:
+#     """Adds empty form fields to a PDF based on a JSON blueprint file.
+#     If json_blueprint_path is None, attempts to load from temp_local_blueprint.json."""
+#     try:
+#         absolute_pdf_path = get_absolute_path(pdf_path)
+        
+#         # If no blueprint path provided, try to load from temp file
+#         if json_blueprint_path is None:
+#             temp_path = get_output_path("temp_local_blueprint", ".json")
+#             if not os.path.exists(temp_path):
+#                 return '{"error": "No blueprint file provided and no temporary blueprint found. Please run field detection first."}'
+#             json_blueprint_path = temp_path
+        
+#         with open(get_absolute_path(json_blueprint_path), 'r') as f:
+#             blueprint = json.load(f)
+
+#         doc = fitz.open(absolute_pdf_path)
+        
+#         # Keep track of sanitized names to ensure uniqueness
+#         used_field_names = set()
+
+#         def sanitize_field_name(name: str) -> str:
+#             # Remove invalid characters, replace spaces with underscores
+#             name = re.sub(r'[^a-zA-Z0-9_]', '', name.replace(' ', '_'))
+#             # Truncate to a reasonable length
+#             return name[:50]
+
+#         for field in blueprint.get("form_fields", []):
+#             page_num_one_based = field.get("page_number", 1)
+#             if not (1 <= page_num_one_based <= len(doc)):
+#                 print(f"[DEBUG-PDF] Skipping field '{field.get('field_name')}' due to invalid page number: {page_num_one_based}.")
+#                 continue
+            
+#             page = doc[page_num_one_based - 1]
+#             coords = field.get("coordinates", [])
+
+#             if not (isinstance(coords, list) and len(coords) == 4 and
+#                     all(isinstance(p, dict) and 'x' in p and 'y' in p and
+#                         isinstance(p['x'], (int, float)) and isinstance(p['y'], (int, float))
+#                         for p in coords)):
+#                 print(f"[DEBUG-PDF] Skipping field '{field.get('field_name')}' due to invalid or malformed coordinates.")
+#                 continue
+
+#             original_name = field.get("field_name", "unnamed")
+#             sanitized_name = sanitize_field_name(original_name)
+            
+#             # Ensure the field name is unique
+#             unique_name = sanitized_name
+#             counter = 1
+#             while unique_name in used_field_names:
+#                 unique_name = f"{sanitized_name}_{counter}"
+#                 counter += 1
+#             used_field_names.add(unique_name)
+
+#             x0 = coords[0]['x'] * page.rect.width
+#             y0 = coords[0]['y'] * page.rect.height
+#             x1 = coords[2]['x'] * page.rect.width
+#             y1 = coords[2]['y'] * page.rect.height
+
+#             # Also validate the rectangle dimensions themselves to prevent errors
+#             if x1 <= x0 or y1 <= y0:
+#                 print(f"[DEBUG-PDF] Skipping field '{unique_name}' due to invalid rectangle dimensions (x1 <= x0 or y1 <= y0). Coords: ({x0}, {y0}, {x1}, {y1})")
+#                 continue
+
+#             rect = fitz.Rect(x0, y0, x1, y1)
+            
+#             # Create widget by setting attributes for compatibility with older PyMuPDF.
+#             widget = fitz.Widget()
+#             widget.rect = rect
+#             widget.field_type = fitz.PDF_WIDGET_TYPE_TEXT
+#             widget.field_name = unique_name
+#             widget.field_value = ""
+            
+#             page.add_widget(widget)
+        
+#         output_path = get_output_path(pdf_path, "_fields_created")
+#         doc.save(output_path, garbage=4, deflate=True, clean=True)
+#         doc.close()
+        
+#         # Return the path AND the list of actual field names created
+#         return json.dumps({
+#             "success": True, 
+#             "path": output_path,
+#             "created_fields": list(used_field_names)
+#         })
+    
+#     except Exception as e:
+#         tb_str = traceback.format_exc()
+#         error_message = f"An error occurred during field creation: {type(e).__name__} - {str(e)}\nTraceback:\n{tb_str}"
+#         print(f"[DEBUG-PDF] {error_message}")
+#         return json.dumps({"error": error_message})
+
 
 def fill_form_fields(pdf_path: str, user_data_json: str) -> str:
     """Fills the existing form fields of a PDF with user data from a JSON string."""
@@ -912,6 +1002,81 @@ def check_configuration() -> str:
         ]}, indent=2)
     except Exception as e:
         return f"An error occurred while checking configuration: {str(e)}"
+    
+def debug_and_visualize_fields(file_path: str, page_num: int):
+    """
+    A debugging utility to visualize the output of the detection functions.
+    It saves an image of the page with detected rectangles drawn on it.
+    """
+    print("="*50)
+    print(f"STARTING DEBUG FOR: {file_path}, PAGE: {page_num}")
+    print("="*50)
+
+    try:
+        doc = fitz.open(get_absolute_path(file_path))
+        if page_num >= len(doc):
+            print(f"Error: Invalid page number. Document only has {len(doc)} pages.")
+            return
+
+        page = doc[page_num]
+
+        # --- Run Detection Functions ---
+        # 1. Vector and OpenCV-based lines
+        vector_cv_rects = extract_vector_lines_fast(page, page_num)
+        print(f"[INFO] Found {len(vector_cv_rects)} potential lines using vector/OpenCV analysis.")
+
+        # 2. Text-based underscores
+        text_underscore_rects = extract_text_underscores(page)
+        print(f"[INFO] Found {len(text_underscore_rects)} potential lines using text underscore analysis.")
+
+        # --- Visualize the Detections ---
+        # Get an image of the page
+        pix = page.get_pixmap(dpi=150)
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+        
+        # OpenCV expects BGR, PyMuPDF gives RGB or GRAY. Convert if necessary.
+        if img.shape[2] == 3: # RGB
+             img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        elif img.shape[2] == 1: # GRAY
+             img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+        # Draw rectangles from vector/CV analysis in RED
+        for rect in vector_cv_rects:
+            # Convert PDF rect coordinates to image pixel coordinates
+            img_rect = rect * (150/72) 
+            p1 = (int(img_rect.x0), int(img_rect.y0))
+            p2 = (int(img_rect.x1), int(img_rect.y1))
+            cv2.rectangle(img, p1, p2, (0, 0, 255), 2) # Red color in BGR
+
+        # Draw rectangles from text analysis in BLUE
+        for rect in text_underscore_rects:
+            # Convert PDF rect coordinates to image pixel coordinates
+            img_rect = rect * (150/72)
+            p1 = (int(img_rect.x0), int(img_rect.y0))
+            p2 = (int(img_rect.x1), int(img_rect.y1))
+            cv2.rectangle(img, p1, p2, (255, 0, 0), 2) # Blue color in BGR
+            
+        # Merge all detected rectangles for a final "green" overlay
+        all_rects = vector_cv_rects + text_underscore_rects
+        merged_rects = merge_overlapping_rects(all_rects, tolerance=5) # Assuming you have this function
+        print(f"[INFO] After merging, resulted in {len(merged_rects)} final field areas.")
+        
+        for rect in merged_rects:
+            img_rect = rect * (150/72)
+            p1 = (int(img_rect.x0), int(img_rect.y0))
+            p2 = (int(img_rect.x1), int(img_rect.y1))
+            cv2.rectangle(img, p1, p2, (0, 255, 0), 1) # Green outline for merged
+
+        # Save the output image
+        output_filename = f"debug_output_page_{page_num}.png"
+        cv2.imwrite(output_filename, img)
+        print(f"\n[SUCCESS] Debug image saved to: {output_filename}")
+        print("Please check this image. Red boxes are from vector/CV, Blue are from text, Green are the final merged fields.")
+
+        doc.close()
+
+    except Exception as e:
+        print(f"An error occurred during debugging: {e}")
 
 def get_tools():
     """Returns the list of tools for the agent."""
@@ -925,4 +1090,5 @@ def get_tools():
         create_fields_from_blueprint,
         fill_form_fields,
         check_configuration,
+        debug_and_visualize_fields,
     ]
